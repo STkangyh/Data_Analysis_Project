@@ -61,7 +61,10 @@
 import warnings
 import numpy as np
 import pandas as pd
+import joblib
+from pathlib import Path
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     accuracy_score, roc_auc_score, log_loss,
     classification_report, confusion_matrix
@@ -69,9 +72,10 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 import lightgbm as lgb
-import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.rcParams['font.family'] = 'AppleGothic'   # macOS 한글 폰트
+matplotlib.use('Agg')    # 비대화형 백엔드 (plt.show() 블로킹 방지)
+import matplotlib.pyplot as plt
+matplotlib.rcParams['font.family'] = 'Malgun Gothic'  # Windows 한글 폰트
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 warnings.filterwarnings('ignore')
@@ -166,6 +170,13 @@ def generate_sample_data(n: int = 500, seed: int = 42) -> pd.DataFrame:
 
             # 구장
             "park_factor": round(rng.uniform(0.85, 1.15), 3),
+            # 최근 팀 컨디션
+            "home_recent_win_rate": round(rng.uniform(0.3, 0.7), 3),
+            "away_recent_win_rate": round(rng.uniform(0.3, 0.7), 3),
+            "home_recent_run_diff": round(rng.uniform(-3.0, 3.0), 2),
+            "away_recent_run_diff": round(rng.uniform(-3.0, 3.0), 2),
+            "home_win_streak":      int(rng.integers(-5, 6)),
+            "away_win_streak":      int(rng.integers(-5, 6)),
         })
 
     return pd.DataFrame(rows)
@@ -307,7 +318,71 @@ def preprocess_data(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["Diff_Team_Avg_RISP"]        = df["Home_Team_Avg_RISP"]        - df["Away_Team_Avg_RISP"]
 
     # ─────────────────────────────────────────
-    # E. 결측치 처리 (중앙값으로 대체)
+    # E. 최근 팀 컨디션 피처
+    # ─────────────────────────────────────────
+    # E-1. 최근 10경기 기반 개별 팀 지표
+    df["Home_Recent_Win_Rate"] = df["home_recent_win_rate"]
+    df["Away_Recent_Win_Rate"] = df["away_recent_win_rate"]
+    df["Home_Recent_Run_Diff"] = df["home_recent_run_diff"]
+    df["Away_Recent_Run_Diff"] = df["away_recent_run_diff"]
+    df["Home_Win_Streak"]      = df["home_win_streak"]
+    df["Away_Win_Streak"]      = df["away_win_streak"]
+
+    # E-2. 최근 컨디션 차분 (홈 - 어웨이)
+    df["Diff_Recent_Win_Rate"] = df["Home_Recent_Win_Rate"] - df["Away_Recent_Win_Rate"]
+    df["Diff_Recent_Run_Diff"] = df["Home_Recent_Run_Diff"] - df["Away_Recent_Run_Diff"]
+    df["Diff_Win_Streak"]      = df["Home_Win_Streak"]      - df["Away_Win_Streak"]
+
+    # ─────────────────────────────────────────
+    # ─────────────────────────────────────────
+    # F. 개막 시즌 더미
+    # ─────────────────────────────────────────
+    KBO_OPENING_DAYS = {
+        2023: pd.Timestamp('2023-04-01'),
+        2024: pd.Timestamp('2024-03-23'),
+        2025: pd.Timestamp('2025-03-22'),
+        2026: pd.Timestamp('2026-03-28'),
+    }
+    df['_season_open'] = df['game_date'].dt.year.map(KBO_OPENING_DAYS)
+    df['_days_into_season'] = (df['game_date'] - df['_season_open']).dt.days
+    df['Is_Opening_Series'] = (df['_days_into_season'] <= 14).astype(int)
+    df.drop(columns=['_season_open', '_days_into_season'], inplace=True)
+
+    # ─────────────────────────────────────────
+    # G. 선발투수 등판 간격
+    # ─────────────────────────────────────────
+    df['Home_SP_Rest_Days'] = df['home_sp_rest_days'].clip(upper=30)
+    df['Away_SP_Rest_Days'] = df['away_sp_rest_days'].clip(upper=30)
+    df['Diff_SP_Rest_Days'] = df['Home_SP_Rest_Days'] - df['Away_SP_Rest_Days']
+
+    # ─────────────────────────────────────────
+    # I. 구장별 투수/타자 피처
+    # ─────────────────────────────────────────
+    # I-1. 선발투수의 해당 구장 ERA/WHIP (없으면 시즌 전체 스탯 fallback)
+    if 'home_sp_stadium_ERA' in df.columns:
+        df['Home_SP_Stadium_ERA']  = df['home_sp_stadium_ERA'].fillna(df['Home_SP_ERA_ParkAdj'])
+        df['Away_SP_Stadium_ERA']  = df['away_sp_stadium_ERA'].fillna(df['Away_SP_ERA_ParkAdj'])
+        df['Home_SP_Stadium_WHIP'] = df['home_sp_stadium_WHIP'].fillna(df['Home_SP_WHIP'])
+        df['Away_SP_Stadium_WHIP'] = df['away_sp_stadium_WHIP'].fillna(df['Away_SP_WHIP'])
+    else:
+        df['Home_SP_Stadium_ERA']  = df['Home_SP_ERA_ParkAdj']
+        df['Away_SP_Stadium_ERA']  = df['Away_SP_ERA_ParkAdj']
+        df['Home_SP_Stadium_WHIP'] = df['Home_SP_WHIP']
+        df['Away_SP_Stadium_WHIP'] = df['Away_SP_WHIP']
+    df['Diff_SP_Stadium_ERA']  = df['Home_SP_Stadium_ERA']  - df['Away_SP_Stadium_ERA']
+
+    # I-2. 타자뒤의 해당 구장 평균 OPS (없으면 시즌 전체 OPS fallback)
+    if 'home_bat_stadium_OPS' in df.columns:
+        df['Home_Bat_Stadium_OPS'] = df['home_bat_stadium_OPS'].fillna(df['Home_Team_Avg_OPS'])
+        df['Away_Bat_Stadium_OPS'] = df['away_bat_stadium_OPS'].fillna(df['Away_Team_Avg_OPS'])
+    else:
+        df['Home_Bat_Stadium_OPS'] = df['Home_Team_Avg_OPS']
+        df['Away_Bat_Stadium_OPS'] = df['Away_Team_Avg_OPS']
+        df['Away_Bat_Stadium_OPS'] = df['Away_Team_Avg_OPS']
+    df['Diff_Bat_Stadium_OPS'] = df['Home_Bat_Stadium_OPS'] - df['Away_Bat_Stadium_OPS']
+
+    # ─────────────────────────────────────────
+    # H. 결측치 처리 (중앙값으로 대체)
     # ─────────────────────────────────────────
     feature_cols = _get_feature_cols()
     for col in feature_cols:
@@ -339,6 +414,21 @@ def _get_feature_cols() -> list:
         "Diff_Bullpen_WHIP_Penalty", "Diff_Team_OPS_Platoon", "Diff_Team_Avg_RISP",
         # 공통
         "Is_Day_Game",
+        # 최근 팀 컨디션 (개별)
+        "Home_Recent_Win_Rate", "Away_Recent_Win_Rate",
+        "Home_Recent_Run_Diff", "Away_Recent_Run_Diff",
+        "Home_Win_Streak", "Away_Win_Streak",
+        # 최근 컨디션 차분
+        "Diff_Recent_Win_Rate", "Diff_Recent_Run_Diff", "Diff_Win_Streak",
+        # 개막 시즌
+        "Is_Opening_Series",
+        # 선발투수 등판 간격
+        "Home_SP_Rest_Days", "Away_SP_Rest_Days", "Diff_SP_Rest_Days",
+        # 구장별 선발투수 ERA/WHIP
+        "Home_SP_Stadium_ERA", "Away_SP_Stadium_ERA", "Diff_SP_Stadium_ERA",
+        "Home_SP_Stadium_WHIP", "Away_SP_Stadium_WHIP",
+        # 구장별 타자 OPS
+        "Home_Bat_Stadium_OPS", "Away_Bat_Stadium_OPS", "Diff_Bat_Stadium_OPS",
     ]
 
 
@@ -474,12 +564,16 @@ def predict_win_probability(
     feature_cols = _get_feature_cols()
     df_proc      = preprocess_data(df_new)
 
-    model  = fitted_results[model_name]["model"]
-    scaler = fitted_results[model_name]["scaler"]
+    model      = fitted_results[model_name]["model"]
+    scaler     = fitted_results[model_name]["scaler"]
+    calibrator = fitted_results[model_name].get("calibrator")
 
-    X_new        = scaler.transform(df_proc[feature_cols].values)
-    pred_label   = model.predict(X_new)
-    pred_proba   = model.predict_proba(X_new)[:, 1]
+    X_new = scaler.transform(df_proc[feature_cols].values)
+    if calibrator is not None:
+        pred_proba = calibrator.predict_proba(X_new)[:, 1]   # Platt 보정
+    else:
+        pred_proba = model.predict_proba(X_new)[:, 1]
+    pred_label = (pred_proba >= 0.5).astype(int)
 
     df_out = df_new.copy()
     df_out["Pred_Result"]    = pred_label            # 1 = 홈팀 승, 0 = 홈팀 패
@@ -518,14 +612,102 @@ def plot_feature_importance(fitted_results: dict, top_n: int = 20) -> None:
         ax.set_xlabel("Importance")
 
     plt.tight_layout()
-    plt.savefig("/Users/younghoon-kang/Data_Analysis_Project/feature_importance.png",
+    plt.savefig("feature_importance.png",
                 dpi=150, bbox_inches="tight")
     plt.show()
     print("  ✅ 피처 중요도 이미지 저장 완료: feature_importance.png")
 
 
 # ──────────────────────────────────────────────
-# 8. 마지막 Fold 상세 평가 리포트
+# 8. 모델 저장 / 불러오기
+# ──────────────────────────────────────────────
+MODEL_DIR = Path("models")
+
+
+def save_models(fitted_results: dict) -> None:
+    """
+    학습된 모델과 스케일러를 models/ 디렉터리에 저장합니다.
+
+    저장 파일:
+        models/{ModelName}_model.pkl   - 학습된 분류 모델
+        models/{ModelName}_scaler.pkl  - 학습에 사용한 StandardScaler
+    """
+    MODEL_DIR.mkdir(exist_ok=True)
+    for model_name, res in fitted_results.items():
+        model_path  = MODEL_DIR / f"{model_name}_model.pkl"
+        scaler_path = MODEL_DIR / f"{model_name}_scaler.pkl"
+        joblib.dump(res["model"],  model_path)
+        joblib.dump(res["scaler"], scaler_path)
+        print(f"  💾 [{model_name}] 저장 완료 → {model_path}, {scaler_path}")
+
+
+def load_models(model_names: list = None) -> dict:
+    """
+    models/ 디렉터리에서 저장된 모델과 스케일러를 불러옵니다.
+
+    Parameters
+    ----------
+    model_names : list or None
+        불러올 모델명 리스트. None이면 디렉터리 내 전체 모델 자동 탐색.
+
+    Returns
+    -------
+    dict : {"ModelName": {"model": ..., "scaler": ...}}
+    """
+    if model_names is None:
+        model_names = [
+            p.stem.replace("_model", "")
+            for p in MODEL_DIR.glob("*_model.pkl")
+        ]
+
+    results = {}
+    for model_name in model_names:
+        model_path  = MODEL_DIR / f"{model_name}_model.pkl"
+        scaler_path = MODEL_DIR / f"{model_name}_scaler.pkl"
+        if not model_path.exists() or not scaler_path.exists():
+            print(f"  ⚠️  [{model_name}] 저장 파일 없음 — 건너뜀")
+            continue
+        results[model_name] = {
+            "model":  joblib.load(model_path),
+            "scaler": joblib.load(scaler_path),
+        }
+        print(f"  📂 [{model_name}] 불러오기 완료 ← {model_path}")
+        cal_path = MODEL_DIR / f"{model_name}_calibrator.pkl"
+        if cal_path.exists():
+            results[model_name]["calibrator"] = joblib.load(cal_path)
+            print(f"  📐 [{model_name}] Platt 캘리브레이터 로드 완료 ← {cal_path}")
+    return results
+
+
+def calibrate_and_save(df_processed: pd.DataFrame, fitted_results: dict) -> dict:
+    """
+    [4순위 개선] Platt Scaling을 이용해 확률 캘리브레이션 적용.
+    홀드아웃 마지막 20%에 cv='prefit' 시그모이드 피팅.
+    저장: models/{ModelName}_calibrator.pkl
+    """
+    feature_cols = _get_feature_cols()
+    X = df_processed[feature_cols].values
+    y = df_processed["result"].values
+    split_idx = int(len(X) * 0.8)
+    X_cal, y_cal = X[split_idx:], y[split_idx:]
+    print(f"  쾔리브레이션 피팅 세트: {len(X_cal)}경기")
+
+    MODEL_DIR.mkdir(exist_ok=True)
+    for model_name, res in fitted_results.items():
+        X_scaled = res["scaler"].transform(X_cal)
+        calibrator = CalibratedClassifierCV(
+            estimator=res["model"], cv="prefit", method="sigmoid"
+        )
+        calibrator.fit(X_scaled, y_cal)
+        cal_path = MODEL_DIR / f"{model_name}_calibrator.pkl"
+        joblib.dump(calibrator, cal_path)
+        fitted_results[model_name]["calibrator"] = calibrator
+        print(f"  📐 [{model_name}] Platt 캘리브레이터 저장 → {cal_path}")
+    return fitted_results
+
+
+# ──────────────────────────────────────────────
+# 9. 마지막 Fold 상세 평가 리포트
 # ──────────────────────────────────────────────
 def print_final_report(df_processed: pd.DataFrame, fitted_results: dict) -> None:
     """
@@ -560,7 +742,7 @@ def print_final_report(df_processed: pd.DataFrame, fitted_results: dict) -> None
 
 
 # ──────────────────────────────────────────────
-# 9. 메인 실행 파이프라인
+# 10. 메인 실행 파이프라인
 # ──────────────────────────────────────────────
 def main(csv_path: str = None) -> None:
     """
@@ -601,6 +783,14 @@ def main(csv_path: str = None) -> None:
     print("\n  📊 피처 중요도 시각화 중...")
     plot_feature_importance(fitted_results, top_n=20)
 
+    # ── 모델 저장
+    print("\n  💾 모델 저장 중...")
+    save_models(fitted_results)
+
+    # ── Platt Scaling 캘리브레이션 (4순위 개선)
+    print("\n  📐 Platt Scaling 캘리브레이션 적용 중...")
+    calibrate_and_save(df_processed, fitted_results)
+
     # ── 샘플 승리 확률 예측 (마지막 5경기)
     print("\n" + "=" * 60)
     print("  🎯 승리 확률 예측 샘플 (마지막 5경기)")
@@ -619,10 +809,8 @@ def main(csv_path: str = None) -> None:
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     # ─────────────────────────────────────────────────────────────────
-    # ▼ 실제 데이터 CSV가 있으면 아래 경로를 지정하세요.
-    #   없으면 None으로 두면 샘플 데이터로 파이프라인이 동작합니다.
+    # ▼ build_raw_data.py로 생성한 실제 데이터를 사용합니다.
     # ─────────────────────────────────────────────────────────────────
-    RAW_DATA_PATH = None
-    # RAW_DATA_PATH = "/Users/younghoon-kang/Data_Analysis_Project/raw_data.csv"
+    RAW_DATA_PATH = "data/raw_data.csv"
 
     main(csv_path=RAW_DATA_PATH)
