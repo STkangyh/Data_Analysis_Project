@@ -667,9 +667,9 @@ def main(target_dates: list[str]):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="2026 KBO 경기 승리 확률 예측")
     parser.add_argument(
-        "--dates", nargs="+", default=["2026-03-28", "2026-03-29"],
+        "--dates", nargs="+", default=[datetime.today().strftime("%Y-%m-%d")],
         metavar="YYYY-MM-DD",
-        help="예측할 날짜 목록 (기본값: 2026-03-28 2026-03-29)"
+        help="예측할 날짜 목록 (기본값: 오늘 날짜)"
     )
     args = parser.parse_args()
     main(args.dates)

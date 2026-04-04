@@ -58,6 +58,7 @@
 # ──────────────────────────────────────────────
 # 0. 라이브러리 임포트
 # ──────────────────────────────────────────────
+import sys
 import warnings
 import numpy as np
 import pandas as pd
@@ -334,7 +335,6 @@ def preprocess_data(df_raw: pd.DataFrame) -> pd.DataFrame:
     df["Diff_Win_Streak"]      = df["Home_Win_Streak"]      - df["Away_Win_Streak"]
 
     # ─────────────────────────────────────────
-    # ─────────────────────────────────────────
     # F. 개막 시즌 더미
     # ─────────────────────────────────────────
     KBO_OPENING_DAYS = {
@@ -377,7 +377,6 @@ def preprocess_data(df_raw: pd.DataFrame) -> pd.DataFrame:
         df['Away_Bat_Stadium_OPS'] = df['away_bat_stadium_OPS'].fillna(df['Away_Team_Avg_OPS'])
     else:
         df['Home_Bat_Stadium_OPS'] = df['Home_Team_Avg_OPS']
-        df['Away_Bat_Stadium_OPS'] = df['Away_Team_Avg_OPS']
         df['Away_Bat_Stadium_OPS'] = df['Away_Team_Avg_OPS']
     df['Diff_Bat_Stadium_OPS'] = df['Home_Bat_Stadium_OPS'] - df['Away_Bat_Stadium_OPS']
 
@@ -758,6 +757,10 @@ def main(csv_path: str = None) -> None:
     ---------------------
         main(csv_path="/Users/younghoon-kang/Data_Analysis_Project/raw_data.csv")
     """
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, OSError):
+        pass
     # ── 데이터 로드
     if csv_path:
         print(f"  📂 실제 데이터 로드: {csv_path}")

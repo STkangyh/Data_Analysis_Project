@@ -1,7 +1,7 @@
 """
 submit_predictions_today.py
 ===========================
-오늘(2026-04-04) 경기 홈팀 승리 확률을 예측하고 Statiz API에 제출합니다.
+오늘 경기 홈팀 승리 확률을 예측하고 Statiz API에 제출합니다.
 
 사용법:
     python submit_predictions_today.py            # 예측 + API 제출
@@ -77,7 +77,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DATA_DIR    = Path("data")
-TARGET_DATE = "2026-04-04"
+TARGET_DATE = datetime.today().strftime("%Y-%m-%d")
 
 
 # ──────────────────────────────────────────────
@@ -160,10 +160,11 @@ def fetch_today_games(client: StatizAPIClientPlus) -> tuple:
     (get_hitter_features가 리그평균으로 자동 대체).
     반환: (df_games, df_lineups)
     """
-    logger.info("[1/4] 4월 경기 일정 수집 중 (대상 날짜: %s)...", TARGET_DATE)
-    games_raw = client.get_schedule(2026, 4)
+    year, month = int(TARGET_DATE[:4]), int(TARGET_DATE[5:7])
+    logger.info("[1/4] %d년 %d월 경기 일정 수집 중 (대상 날짜: %s)...", year, month, TARGET_DATE)
+    games_raw = client.get_schedule(year, month)
     time.sleep(REQUEST_DELAY)
-    logger.info("  → 4월 일정 %d경기 발견", len(games_raw))
+    logger.info("  → %d월 일정 %d경기 발견", month, len(games_raw))
 
     target_games = []
     for g in games_raw:
@@ -417,6 +418,11 @@ def submit_prediction(client: StatizAPIClientPlus,
 # 메인
 # ──────────────────────────────────────────────
 def main():
+    global TARGET_DATE
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, OSError):
+        pass
     parser = argparse.ArgumentParser(description="오늘 경기 승리 확률 예측 및 제출")
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -426,7 +432,13 @@ def main():
         "--only", nargs="+", default=None, metavar="팀명",
         help="제출할 팀명 목록 (해당 팀이 포함된 경기만 제출, 예: --only 두산 한화)",
     )
+    parser.add_argument(
+        "--date", default=None, metavar="YYYY-MM-DD",
+        help="예측/제출 대상 날짜 (기본값: 오늘 날짜, 예: --date 2026-04-05)",
+    )
     args = parser.parse_args()
+    if args.date:
+        TARGET_DATE = args.date
 
     if args.dry_run:
         logger.info("★ DRY-RUN 모드: 예측만 출력합니다 (API 제출 없음)")
