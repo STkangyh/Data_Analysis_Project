@@ -274,8 +274,12 @@ def build_2026_rolling_stats(client: StatizAPIClient,
     seed_deques = build_seed_records(gres_hist, window)
 
     # 2026 완료 경기 수집 (parse_game_record가 state==3/5만 통과시킴)
-    games_raw = client.get_schedule(2026, 3)
-    time.sleep(REQUEST_DELAY)
+    # 대상 날짜 기준으로 필요한 월만 조회
+    max_month = int(max(target_dates)[5:7])
+    games_raw = []
+    for month in range(3, max_month + 1):
+        games_raw.extend(client.get_schedule(2026, month))
+        time.sleep(REQUEST_DELAY)
 
     all_games = [
         rec for g in games_raw
@@ -329,9 +333,13 @@ def fetch_target_games(client: StatizAPIClient, target_dates: list[str]) -> tupl
     """
     print(f"\n[1/3] 경기 결과 수집: {target_dates}")
 
-    # 2026년 3월 일정 전체 수집 후 날짜 필터
-    games_raw = client.get_schedule(2026, 3)
-    time.sleep(REQUEST_DELAY)
+    # 대상 날짜의 월 목록 추출 → 필요한 월만 API 호출
+    months_needed = sorted(set(int(d[5:7]) for d in target_dates))
+    games_raw = []
+    for month in months_needed:
+        monthly = client.get_schedule(2026, month)
+        games_raw.extend(monthly)
+        time.sleep(REQUEST_DELAY)
 
     target_games = []
     for g in games_raw:
