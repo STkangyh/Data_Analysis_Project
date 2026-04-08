@@ -12,12 +12,13 @@
 3. [데이터 수집 스크립트](#3-데이터-수집-스크립트)
 4. [피처 엔지니어링 (build_raw_data.py)](#4-피처-엔지니어링)
 5. [모델 학습 (baseball_baseline.py)](#5-모델-학습)
-6. [당일 예측 및 제출 (submit_predictions_today.py)](#6-당일-예측-및-제출)
-7. [API 인증 상세](#7-api-인증-상세)
-8. [매일 운영 워크플로](#8-매일-운영-워크플로)
-9. [데이터 파일 명세](#9-데이터-파일-명세)
-10. [모델 성능 이력](#10-모델-성능-이력)
-11. [트러블슈팅](#11-트러블슈팅)
+6. [자동화 파이프라인 (daily_pipeline.py)](#6-자동화-파이프라인)
+7. [당일 예측 및 제출 (submit_predictions_today.py)](#7-당일-예측-및-제출)
+8. [API 인증 상세](#8-api-인증-상세)
+9. [매일 운영 워크플로](#9-매일-운영-워크플로)
+10. [데이터 파일 명세](#10-데이터-파일-명세)
+11. [모델 성능 이력](#11-모델-성능-이력)
+12. [트러블슈팅](#12-트러블슈팅)
 
 ---
 
@@ -44,7 +45,7 @@
 │  build_raw_data.py                                          │
 │  → 투수ERA/WAR/WHIP·불펜페널티·타자OPS/RISP/플래툰          │
 │  → 구장 파크팩터·롤링 컨디션·차분 피처                       │
-│  → data/raw_data.csv (2,145행 × 50열)                      │
+│  → data/raw_data.csv (2,160행 × 50열)                      │
 └──────────────────────┬──────────────────────────────────────┘
                        │
                        ▼
@@ -58,10 +59,25 @@
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   예측 및 제출 레이어                         │
-│  submit_predictions_today.py                                │
+│                     예측 레이어                              │
+│  predict_2026.py                                            │
 │  → 당일 라인업 수집 → 앙상블 예측                            │
+│  → data/predictions_YYYYMMDD.csv 저장                       │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     제출 레이어                              │
+│  submit_predictions_today.py                                │
 │  → POST /prediction/savePrediction                          │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│              자동화 오케스트레이션                            │
+│  daily_pipeline.py  — Step 1~5 순차 실행                    │
+│  Task Scheduler: 13:00 / 16:00 / 17:30  (WakeToRun 활성)   │
+│  최대 절전(Hibernate)에서 자동 기상 후 실행                   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -250,11 +266,80 @@ raw_data.csv
 
 ---
 
-## 6. 당일 예측 및 제출
+## 6. 자동화 파이프라인 (daily_pipeline.py)
+
+### 역할
+
+Step 1~5를 순서대로 실행하는 오케스트레이터입니다. Windows Task Scheduler에 등록되어 **매일 자동 실행**됩니다.
+
+### 실행 단계
+
+| 단계   | 스크립트                      | 설명                                 | 하루 1회 가드        |
+| ------ | ----------------------------- | ------------------------------------ | -------------------- |
+| Step 1 | `append_2026_games.py`        | 전날 경기 결과 수집 & CSV append     | ✅ 마커로 중복 방지  |
+| Step 2 | `build_raw_data.py`           | raw_data.csv 재빌드                  | ✅ 마커로 중복 방지  |
+| Step 3 | `baseball_baseline.py`        | 모델 재학습 (`--skip-train` 시 생략) | -                    |
+| Step 4 | `predict_2026.py`             | 오늘 경기 예측 → CSV 저장            | ✅ 파일 존재 시 생략 |
+| Step 5 | `submit_predictions_today.py` | API 제출                             | ✅ 마커로 중복 방지  |
+
+### 마커 파일 (하루 1회 가드)
+
+`logs/` 폴더에 마커 파일이 생성되어 당일 중복 실행을 방지합니다.
+
+| 파일                                | 생성 시점      | 효과                 |
+| ----------------------------------- | -------------- | -------------------- |
+| `logs/data_updated_YYYYMMDD.marker` | Step 2 완료 후 | 당일 Step 1·2 건너뜀 |
+| `logs/submitted_YYYYMMDD.marker`    | Step 5 완료 후 | 당일 Step 5 건너뜀   |
+
+날짜가 바뀌면 마커 이름도 달라지므로 새로운 날에는 자동으로 초기화됩니다.
+
+### Task Scheduler 등록 현황
+
+| 태스크 이름           | 실행 시각 | 옵션                   | 동작                                |
+| --------------------- | --------- | ---------------------- | ----------------------------------- |
+| `KBO_Predict_Day`     | 13:00     | `--skip-train`         | 데이터 수집·예측·제출 (재학습 없이) |
+| `KBO_Predict_Evening` | 16:00     | `--skip-train --force` | 라인업 반영 재예측·재제출           |
+| `KBO_Predict_Night`   | 17:30     | (없음)                 | 재학습 포함 전체 파이프라인         |
+
+모든 태스크에 `WakeToRun = True` 설정 완료.
+
+> **절전 모드 주의:** 이 PC는 S0(Connected Standby) 방식입니다.  
+> 일반 절전에서는 WakeToRun이 작동하지 않으므로 **최대 절전(Hibernate)** 또는 PC가 켜진 상태를 유지해야 합니다.  
+> PC 끄기: `시작 → 전원 → 최대 절전` 또는 `shutdown /h`
+
+### CLI 옵션
+
+```bash
+# 기본 실행 (재학습 없이, 당일 최초 실행 시)
+python daily_pipeline.py --skip-train
+
+# 라인업 반영 후 재예측·재제출 (마커 무시)
+python daily_pipeline.py --skip-train --force
+
+# 재학습 포함 전체 실행
+python daily_pipeline.py
+
+# 데이터 수집·재빌드도 강제 재실행
+python daily_pipeline.py --force-data
+
+# 날짜 직접 지정
+python daily_pipeline.py --skip-train --date 2026-04-07
+```
+
+### 로그 파일
+
+실행 결과는 `logs/pipeline_YYYYMMDD.log`에 기록됩니다.  
+Step 별 성공/실패 여부와 최종 예측 결과를 확인할 수 있습니다.
+
+---
+
+## 7. 당일 예측 및 제출
 
 ### submit_predictions_today.py
 
 **역할:** 당일 경기 라인업 수집 → 앙상블 예측 → API 제출
+
+> 일반적으로 `daily_pipeline.py`가 자동 호출합니다. 수동 재제출이 필요할 때만 직접 실행합니다.
 
 **실행 옵션:**
 
@@ -267,12 +352,15 @@ python submit_predictions_today.py --only 두산 한화
 
 # 예측만 출력 (제출 없음)
 python submit_predictions_today.py --dry-run
+
+# 날짜 직접 지정
+python submit_predictions_today.py --date 2026-04-07
 ```
 
 **내부 동작 순서:**
 
 ```
-[1/4] 4월 일정 API 수집 → TARGET_DATE 경기 필터
+[1/4] 4월 일정 API 수집 → 대상 날짜 경기 필터
 [2/4] 각 경기 라인업 수집 (선발 라인업 공개 전이면 투수 2명만)
 [3/4] game_results CSV 기반 rolling stats 계산 (최근 10경기)
 [4/4] 피처 조립 → XGBoost·LightGBM 앙상블 예측
@@ -284,14 +372,14 @@ python submit_predictions_today.py --dry-run
 | 항목             | 내용                                                |
 | ---------------- | --------------------------------------------------- |
 | 제출 마감        | 경기 시작 **15분 전**까지 (17:00 경기 → 16:45 마감) |
-| 라인업 권장 시점 | 경기 시작 **1시간 전** 이후 (16:00~) 재실행         |
-| `TARGET_DATE`    | 파일 상단에 하드코딩 — 매일 날짜 업데이트 필요      |
+| 라인업 권장 시점 | 경기 시작 **1시간 전** 이후 (16:00~) 재실행 권장    |
+| `TARGET_DATE`    | `datetime.today()` 기본값 — 별도 업데이트 불필요    |
 
 **출력 결과 CSV:** `data/predictions_YYYYMMDD.csv`
 
 ---
 
-## 7. API 인증 상세
+## 8. API 인증 상세
 
 ### Statiz API v4 HMAC-SHA256 인증
 
@@ -367,37 +455,50 @@ req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
 ---
 
-## 8. 매일 운영 워크플로
+## 9. 매일 운영 워크플로
 
-### 경기 당일 루틴
+### 9-1. 자동 실행 (권장)
+
+**경기 당일 할 일: PC를 최대 절전(Hibernate)으로 두기만 하면 됩니다.**
+
+Task Scheduler가 13:00 / 16:00 / 17:30에 자동으로 PC를 깨워 파이프라인을 실행합니다.
+
+```
+경기 당일 아침 → PC를 최대 절전으로 전환
+                 ↓
+   13:00  KBO_Predict_Day 자동 실행
+          (데이터 수집 + 예측 + 제출)
+                 ↓
+   16:00  KBO_Predict_Evening 자동 실행
+          (라인업 반영 재예측 + 재제출)
+                 ↓
+   17:30  KBO_Predict_Night 자동 실행
+          (모델 재학습 + 최종 예측 + 재제출)
+```
+
+### 9-2. 수동 실행 (자동화 실패 시)
 
 ```bash
-# ① 전날 경기 결과 수집 (당일 아침)
-python append_2026_games.py --cutoff $(date +%Y-%m-%d)
+# 오전: 데이터 수집 + 예측 + 제출
+python daily_pipeline.py --skip-train
 
-# ② raw_data 재빌드
-python build_raw_data.py
+# 경기 시작 1시간 전: 라인업 반영 재예측 + 재제출
+python daily_pipeline.py --skip-train --force
 
-# ③ 모델 재학습
-python baseball_baseline.py
-
-# ④ submit_predictions_today.py 상단 TARGET_DATE 업데이트
-#    TARGET_DATE = "2026-04-05"  ← 오늘 날짜로 변경
-
-# ⑤ 라인업 공개 후 (경기 시작 1시간 전) 예측·제출
+# 또는 submit 단독 실행
 python submit_predictions_today.py
 ```
 
-### 주간 점검 항목
+### 9-3. 주간 점검 항목
 
-- [ ] `data/game_results_2023_2025.csv` 행 수 증가 확인
-- [ ] 모델 holdout accuracy 추이 모니터링
+- [ ] `logs/pipeline_YYYYMMDD.log`에서 Step 5 성공(code=100) 여부 확인
+- [ ] `data/game_results_2023_2025.csv` 행 수 증가 확인 (매일 +5경기 내외)
+- [ ] 모델 holdout accuracy 추이 모니터링 (`logs/` 확인)
 - [ ] 외국인 선수 교체 시 `FOREIGN_NAME_KO_MAP` 업데이트 (`predict_2026.py`)
-- [ ] `TARGET_DATE` 매일 업데이트 (TODO: CLI 인수로 개선 예정)
 
 ---
 
-## 9. 데이터 파일 명세
+## 10. 데이터 파일 명세
 
 ### data/game_results_2023_2025.csv
 
@@ -433,15 +534,16 @@ python submit_predictions_today.py
 
 ---
 
-## 10. 모델 성능 이력
+## 11. 모델 성능 이력
 
 | 날짜       | 학습 데이터               | XGB Acc | LGB Acc | XGB AUC | LGB AUC |
 | ---------- | ------------------------- | ------- | ------- | ------- | ------- |
 | 2026-04-03 | 2023~2026/4/3 (2,145경기) | 56.0%   | 58.0%   | 0.5898  | 0.5805  |
+| 2026-04-07 | 2023~2026/4/7 (2,160경기) | 54.0%   | 54.0%   | 0.5747  | 0.5814  |
 
 ---
 
-## 11. 트러블슈팅
+## 12. 트러블슈팅
 
 ### Q. 라인업 수집 시 2명만 나온다
 
@@ -475,3 +577,28 @@ logger.info("payload: %s", payload)
 
 외국인 선수 교체, 트레이드, 부상 등으로 롤링 스탯이 오염됐을 가능성이 있습니다.  
 `append_2026_games.py` → `build_raw_data.py` → `baseball_baseline.py` 순서로 재실행해 최신 데이터를 반영하세요.
+
+### Q. 자동화 태스크가 실행됐는데 제출이 안 됐다
+
+1. `logs/pipeline_YYYYMMDD.log`를 열어 Step 5 결과 확인
+2. `logs/submitted_YYYYMMDD.marker` 파일이 있으면 이미 제출된 것 (code=100)
+3. 마커가 없고 로그에 `[FAIL]`이 있으면 Step 5 실패 → 수동으로 `python submit_predictions_today.py` 실행
+
+### Q. 라인업이 바뀐 후 재제출하고 싶다
+
+```bash
+python daily_pipeline.py --skip-train --force
+# 또는
+python submit_predictions_today.py
+```
+
+`--force` 옵션은 `submitted_YYYYMMDD.marker`를 무시하고 재제출합니다.
+
+### Q. PC를 완전히 껐는데 자동으로 안 켜졌다
+
+Wake Timer는 **최대 절전(Hibernate)**에서만 작동합니다. 완전 종료(Shutdown)에서는 작동하지 않습니다.  
+경기 당일에는 `시작 → 전원 → 최대 절전` 또는 `shutdown /h`를 사용하세요.
+
+### Q. daily_pipeline.py가 없다는 오류 (exit=2)
+
+파일이 삭제된 경우입니다. 프로젝트 루트 디렉터리에 `daily_pipeline.py`가 있는지 확인하고, 없으면 git에서 복구하거나 재생성하세요.
