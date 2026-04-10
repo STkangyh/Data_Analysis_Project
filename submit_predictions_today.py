@@ -33,7 +33,7 @@ import urllib.parse
 import warnings
 import logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -463,77 +463,194 @@ def main():
         print("\n예측할 경기가 없습니다. 종료.")
         return
 
-    # ── [2/4] Rolling stats (CSV 기반)
+    # ── [2/4] Rolling stats (CSV 기반) — 한 번만 계산 (재사용)
     logger.info("\n[3/4] Rolling stats 계산 중 (game_results CSV 기반)...")
     rolling_data = build_rolling_from_csv(window=10)
 
-    # ── [3/4] 피처 조립
-    logger.info("\n[4/4] 피처 조립 및 예측 중...")
-    df_feat = assemble_features(df_games, df_lineups, rolling_data)
+    # ── 경기 시작 시각 파악 (재시도 마감 계산용)
+    game_times: dict[int, datetime] = {}
+    for _, row in df_games.iterrows():
+        gid = int(row["game_id"])
+        gtime_str = str(row.get("game_time", ""))
+        try:
+            h, m = map(int, gtime_str.split(":"))
+            game_times[gid] = datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+        except (ValueError, AttributeError):
+            pass
 
-    # ── 예측
-    df_result = run_predictions(df_feat)
+    RETRY_INTERVAL = 300          # 5분
+    DEADLINE_BUFFER = timedelta(minutes=15)   # 경기 시작 15분 전 마감
+    submitted_game_ids: set[int] = set()
+    all_game_ids: set[int] = set(int(row["game_id"]) for _, row in df_games.iterrows())
+    first_attempt = True
 
-    # ── 결과 출력
-    print("\n" + "=" * 65)
-    print("  🎯 예측 결과")
-    print("=" * 65)
-    display_cols = [c for c in
-                    ["game_time", "home_team", "away_team",
-                     "home_sp_name", "away_sp_name",
-                     "XGB_Prob", "LGB_Prob", "Ensemble_Prob", "Pred_Winner"]
-                    if c in df_result.columns]
-    print(df_result[display_cols].to_string(index=False))
+    while True:
+        now = datetime.now()
 
-    # ── 제출
-    print("\n" + "=" * 65)
-    print("  📤 API 제출")
-    print("=" * 65)
+        # ── 아직 제출 안 된 경기 중 가장 빠른 시작 시각
+        pending_ids = all_game_ids - submitted_game_ids
+        if not pending_ids:
+            break
 
-    submit_results = []
-    for _, row in df_result.iterrows():
-        s_no    = int(row["game_id"])
-        percent = float(row["Ensemble_Prob"])
-        home    = row["home_team"]
-        away    = row["away_team"]
-        gtime   = row.get("game_time", "")
-        hs      = row.get("home_sp_name", "")
-        as_     = row.get("away_sp_name", "")
+        earliest_pending_dt = None
+        for gid in pending_ids:
+            gdt = game_times.get(gid)
+            if gdt and (earliest_pending_dt is None or gdt < earliest_pending_dt):
+                earliest_pending_dt = gdt
 
-        # --only 필터: 지정 팀이 포함된 경기만 제출
-        if args.only:
-            if not any(t in (home, away) for t in args.only):
-                logger.info("  ○ 제출 스킵: %s vs %s (--only 필터)", home, away)
+        # 마감 시각 초과 → 최종 강제 제출
+        force_submit = False
+        if earliest_pending_dt and now >= earliest_pending_dt - DEADLINE_BUFFER:
+            force_submit = True
+
+        # ── 라인업 재수집 (첫 시도는 이미 수집 완료)
+        if not first_attempt:
+            logger.info("\n  [retry] 라인업 재수집 중...")
+            _, df_lineups = fetch_today_games(client)
+
+        # ── 피처 조립 + 예측
+        if first_attempt:
+            logger.info("\n[4/4] 피처 조립 및 예측 중...")
+        else:
+            logger.info("  [retry] 피처 재조립 및 재예측 중...")
+        df_feat = assemble_features(df_games, df_lineups, rolling_data)
+        df_result = run_predictions(df_feat)
+
+        # ── 결과 출력 (첫 시도만)
+        if first_attempt:
+            print("\n" + "=" * 65)
+            print("  🎯 예측 결과")
+            print("=" * 65)
+            display_cols = [c for c in
+                            ["game_time", "home_team", "away_team",
+                             "home_sp_name", "away_sp_name",
+                             "XGB_Prob", "LGB_Prob", "Ensemble_Prob", "Pred_Winner"]
+                            if c in df_result.columns]
+            print(df_result[display_cols].to_string(index=False))
+
+        # ── 라인업 인원 계산
+        lineup_counts: dict = {}
+        if not df_lineups.empty and "game_id" in df_lineups.columns:
+            lineup_counts = df_lineups.groupby("game_id").size().to_dict()
+
+        # ── 제출 루프
+        if first_attempt:
+            print("\n" + "=" * 65)
+            print("  📤 API 제출")
+            print("=" * 65)
+
+        submit_results = []
+        for _, row in df_result.iterrows():
+            s_no    = int(row["game_id"])
+            percent = float(row["Ensemble_Prob"])
+            home    = row["home_team"]
+            away    = row["away_team"]
+            gtime   = row.get("game_time", "")
+            hs      = row.get("home_sp_name", "")
+            as_     = row.get("away_sp_name", "")
+
+            # 이미 제출 완료된 경기 건너뜀
+            if s_no in submitted_game_ids:
                 continue
 
-        logger.info(
-            "  → [%s] %s(%s) vs %s(%s)  홈팀 승리확률=%.2f%%",
-            gtime, home, hs, away, as_, percent,
-        )
+            # 선발 라인업 미공개 가드 (force_submit이면 강제 통과)
+            if not args.dry_run and not force_submit:
+                n_players = lineup_counts.get(s_no, 0)
+                if n_players <= 2:
+                    logger.info(
+                        "  ○ 제출 대기: %s vs %s — 선발 라인업 미공개 (수집 인원 %d명, 투수만 존재)",
+                        home, away, n_players,
+                    )
+                    continue
 
-        resp = submit_prediction(client, s_no, percent, dry_run=args.dry_run)
+            # --only 필터: 지정 팀이 포함된 경기만 제출
+            if args.only:
+                if not any(t in (home, away) for t in args.only):
+                    logger.info("  ○ 제출 스킵: %s vs %s (--only 필터)", home, away)
+                    continue
 
-        status = "DRY-RUN"
-        if resp is not None:
-            code = resp.get("code") or resp.get("cdoe")  # 오타 방어
-            msg  = resp.get("result_msg", str(resp))
-            if "error" in resp:
-                status = f"실패 ({resp['error']})"
-            else:
-                status = f"성공 (code={code}, msg={msg})"
-        logger.info("     결과: %s", status)
+            # 경기 시작 1시간 전 제출 가드 (force_submit이면 강제 통과)
+            if not args.dry_run and not force_submit and gtime:
+                try:
+                    now_check = datetime.now()
+                    h, m = map(int, gtime.split(":"))
+                    game_dt   = now_check.replace(hour=h, minute=m, second=0, microsecond=0)
+                    cutoff_dt = game_dt - timedelta(hours=1)
+                    if now_check < cutoff_dt:
+                        mins_left = int((cutoff_dt - now_check).total_seconds() / 60)
+                        logger.info(
+                            "  ○ 제출 대기: %s vs %s [%s] — 제출 가능 시각 %s까지 %d분 남음",
+                            home, away, gtime, cutoff_dt.strftime("%H:%M"), mins_left,
+                        )
+                        continue
+                except (ValueError, AttributeError):
+                    pass
 
-        submit_results.append({
-            "game_id":       s_no,
-            "home_team":     home,
-            "away_team":     away,
-            "Ensemble_Prob": percent,
-            "submit_status": status,
-        })
+            if force_submit and lineup_counts.get(s_no, 0) <= 2:
+                logger.info(
+                    "  ⚠ 강제 제출: %s vs %s — 라인업 미공개이나 경기 시작 임박, 현재 예측으로 제출",
+                    home, away,
+                )
 
-        time.sleep(REQUEST_DELAY)
+            logger.info(
+                "  → [%s] %s(%s) vs %s(%s)  홈팀 승리확률=%.2f%%",
+                gtime, home, hs, away, as_, percent,
+            )
+
+            resp = submit_prediction(client, s_no, percent, dry_run=args.dry_run)
+
+            status = "DRY-RUN"
+            if resp is not None:
+                code = resp.get("code") or resp.get("cdoe")  # 오타 방어
+                msg  = resp.get("result_msg", str(resp))
+                if "error" in resp:
+                    status = f"실패 ({resp['error']})"
+                else:
+                    status = f"성공 (code={code}, msg={msg})"
+                    submitted_game_ids.add(s_no)
+            logger.info("     결과: %s", status)
+
+            submit_results.append({
+                "game_id":       s_no,
+                "home_team":     home,
+                "away_team":     away,
+                "Ensemble_Prob": percent,
+                "submit_status": status,
+            })
+
+            time.sleep(REQUEST_DELAY)
+
+        first_attempt = False
+
+        # ── 모두 제출됐으면 종료
+        if not (all_game_ids - submitted_game_ids):
+            break
+
+        # dry-run은 재시도 안 함
+        if args.dry_run:
+            break
+
+        # 강제 제출 후에도 남았으면(API 에러 등) 더 이상 재시도 불가
+        if force_submit:
+            break
+
+        # ── 대기: 가장 빠른 미제출 경기 시작 15분 전까지 5분 간격 재시도
+        remaining = all_game_ids - submitted_game_ids
+        if earliest_pending_dt:
+            mins_to_deadline = int((earliest_pending_dt - DEADLINE_BUFFER - datetime.now()).total_seconds() / 60)
+            logger.info(
+                "\n  ⏳ %d경기 미제출 — 마감(%s)까지 약 %d분 남음, 5분 후 라인업 재확인...",
+                len(remaining),
+                (earliest_pending_dt - DEADLINE_BUFFER).strftime("%H:%M"),
+                max(0, mins_to_deadline),
+            )
+        else:
+            logger.info("\n  ⏳ %d경기 미제출 — 5분 후 라인업 재확인...", len(remaining))
+
+        time.sleep(RETRY_INTERVAL)
 
     # ── 최종 요약
+    actually_submitted = len(submitted_game_ids)
     print("\n" + "=" * 65)
     print("  📋 제출 요약")
     print("=" * 65)
@@ -549,6 +666,12 @@ def main():
     out_path = DATA_DIR / f"predictions_{TARGET_DATE.replace('-', '')}.csv"
     df_result.to_csv(out_path, index=False, encoding="utf-8-sig")
     logger.info("\n💾 예측 결과 저장: %s", out_path)
+
+    # 실제 제출이 0건이면 exit(2) — daily_pipeline.py 가 마커를 생성하지 않도록
+    # (dry-run은 마커와 무관하므로 exit(0) 유지)
+    if not args.dry_run and actually_submitted == 0:
+        logger.info("[exit=2] 제출된 경기 없음 (라인업 미공개 또는 1시간 전 미도달) — 다음 실행에 재시도")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

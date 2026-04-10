@@ -155,14 +155,23 @@ if submit_marker.exists() and not args.force:
     log.info(f"[Step 5] API 제출 — 오늘 이미 완료, 건너뜀 ({submit_marker.name})")
 else:
     log.info("[Step 5] 예측 결과 API 제출")
-    ok = run_step(
-        "submit_predictions_today",
-        [PYTHON, str(PROJECT / "submit_predictions_today.py")],
-    )
-    if ok:
+    log.info(">> submit_predictions_today")
+    _submit_cmd = [PYTHON, str(PROJECT / "submit_predictions_today.py")]
+    log.info(f"  CMD: {' '.join(_submit_cmd)}")
+    _env = os.environ.copy()
+    _env["PYTHONIOENCODING"] = "utf-8"
+    _submit_result = subprocess.run(_submit_cmd, cwd=str(PROJECT), env=_env)
+    if _submit_result.returncode == 0:
+        # 1건 이상 실제 제출 성공
         submit_marker.write_text(f"submitted at {datetime.now().isoformat()}")
+        log.info("  [OK] submit_predictions_today 완료")
         log.info(f"  [marker] 제출 마커 생성: {submit_marker.name}")
+    elif _submit_result.returncode == 2:
+        # 라인업 미공개 또는 1시간 전 미도달 — 정상적인 대기 상태
+        log.info("  [WAIT] 제출 대기 중 — 라인업 미공개 또는 경기 시작 1시간 전 미도달")
+        log.info("         마커를 생성하지 않습니다. 다음 실행(16:00 또는 17:30)에 재시도합니다.")
     else:
+        log.warning(f"  [FAIL] submit_predictions_today 실패 (exit={_submit_result.returncode})")
         log.warning("  제출 실패 — 예측 파일은 저장됨, 수동 제출 필요")
 log.info("")
 
